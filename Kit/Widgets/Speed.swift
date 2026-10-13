@@ -11,6 +11,48 @@
 
 import Cocoa
 
+// Width of the value column that fits the text. It grows immediately, but shrinks only when the text was narrower for some time,
+// otherwise the widget (and everything next to it in the menu bar) would jump on every value change.
+private final class SpeedValueWidth {
+    private let shrinkDelay: TimeInterval = 15
+    
+    private var width: CGFloat = 0
+    private var pendingWidth: CGFloat = 0
+    private var pendingSince: TimeInterval? = nil
+    
+    var isSettling: Bool { self.pendingSince != nil }
+    
+    func fit(_ textWidth: CGFloat) -> CGFloat {
+        let textWidth = textWidth.rounded(.up)
+        let now = ProcessInfo.processInfo.systemUptime
+        
+        guard textWidth < self.width else {
+            self.width = textWidth
+            self.pendingSince = nil
+            return self.width
+        }
+        guard let since = self.pendingSince else {
+            self.pendingWidth = textWidth
+            self.pendingSince = now
+            return self.width
+        }
+        
+        self.pendingWidth = max(self.pendingWidth, textWidth)
+        if now - since >= self.shrinkDelay {
+            self.width = self.pendingWidth
+            self.pendingWidth = textWidth
+            self.pendingSince = textWidth < self.width ? now : nil
+        }
+        
+        return self.width
+    }
+    
+    func reset() {
+        self.width = 0
+        self.pendingSince = nil
+    }
+}
+
 public class SpeedWidget: WidgetWrapper {
     private var icon: String = "dots"
     private var valueState: Bool = true
@@ -22,6 +64,7 @@ public class SpeedWidget: WidgetWrapper {
     private var modeState: String = "twoRows"
     private var iconAlignmentState: String = "left"
     private var displayValueState: String = "oi"
+    private var fixedSizeState: Bool = true
     
     private var inputColorState: SColor = .secondBlue
     private var outputColorState: SColor = .secondRed
@@ -41,6 +84,9 @@ public class SpeedWidget: WidgetWrapper {
     }
     
     private var width: CGFloat = 58
+    private var inputWidth: SpeedValueWidth = SpeedValueWidth()
+    private var outputWidth: SpeedValueWidth = SpeedValueWidth()
+    private var _widthSettling: Bool = false
     
     private var valueColorView: NSPopUpButton? = nil
     private var valueAlignmentView: NSPopUpButton? = nil
@@ -127,6 +173,7 @@ public class SpeedWidget: WidgetWrapper {
             self.iconAlignmentState = Store.shared.string(key: "\(self.title)_\(self.type.rawValue)_iconAlignment", defaultValue: self.iconAlignmentState)
             self.iconColorState = Store.shared.string(key: "\(self.title)_\(self.type.rawValue)_iconColor", defaultValue: self.iconColorState)
             self.displayValueState = Store.shared.string(key: "\(self.title)_\(self.type.rawValue)_displayValue", defaultValue: self.displayValueState)
+            self.fixedSizeState = Store.shared.bool(key: "\(self.title)_\(self.type.rawValue)_size", defaultValue: self.fixedSizeState)
         }
         
         if preview {
@@ -152,6 +199,9 @@ public class SpeedWidget: WidgetWrapper {
             width = 0
         }
         
+        let settling = self.inputWidth.isSettling || self.outputWidth.isSettling
+        self.queue.sync { self._widthSettling = settling }
+        
         self.setWidth(width)
     }
     
@@ -166,7 +216,8 @@ public class SpeedWidget: WidgetWrapper {
                 symbol: self.symbols.input,
                 iconColor: self.inputColor(self.iconColorState),
                 value: self.inputValue,
-                valueColor: self.inputColor(self.valueColorState)
+                valueColor: self.inputColor(self.valueColorState),
+                valueWidth: self.inputWidth
             )
         } else {
             width = self.drawRowItem(
@@ -174,7 +225,8 @@ public class SpeedWidget: WidgetWrapper {
                 symbol: self.symbols.output,
                 iconColor: self.outputColor(self.iconColorState),
                 value: self.outputValue,
-                valueColor: self.outputColor(self.valueColorState)
+                valueColor: self.outputColor(self.valueColorState),
+                valueWidth: self.outputWidth
             )
         }
         
@@ -186,7 +238,8 @@ public class SpeedWidget: WidgetWrapper {
                     symbol: self.symbols.input,
                     iconColor: self.inputColor(self.iconColorState),
                     value: self.inputValue,
-                    valueColor: self.inputColor(self.valueColorState)
+                    valueColor: self.inputColor(self.valueColorState),
+                    valueWidth: self.inputWidth
                 )
             } else {
                 width = self.drawRowItem(
@@ -194,7 +247,8 @@ public class SpeedWidget: WidgetWrapper {
                     symbol: self.symbols.output,
                     iconColor: self.outputColor(self.iconColorState),
                     value: self.outputValue,
-                    valueColor: self.outputColor(self.valueColorState)
+                    valueColor: self.outputColor(self.valueColorState),
+                    valueWidth: self.outputWidth
                 )
             }
         }
@@ -202,7 +256,7 @@ public class SpeedWidget: WidgetWrapper {
         return width + Constants.Widget.margin.x
     }
     
-    private func drawRowItem(initWidth: CGFloat, symbol: String, iconColor: NSColor, value: Int64, valueColor: NSColor) -> CGFloat {
+    private func drawRowItem(initWidth: CGFloat, symbol: String, iconColor: NSColor, value: Int64, valueColor: NSColor, valueWidth: SpeedValueWidth) -> CGFloat {
         var width = initWidth
         
         if self.iconAlignmentState == "left" {
@@ -219,7 +273,7 @@ public class SpeedWidget: WidgetWrapper {
         }
         
         if self.valueState {
-            width += self.drawValue(value, offset: CGPoint(x: width, y: 0), color: valueColor)
+            width += self.drawValue(value, offset: CGPoint(x: width, y: 0), color: valueColor, valueWidth: valueWidth)
         }
         
         if self.iconAlignmentState == "right" {
@@ -240,27 +294,36 @@ public class SpeedWidget: WidgetWrapper {
         return width
     }
     
-    private func drawValue(_ value: Int64, offset: CGPoint, color: NSColor) -> CGFloat {
-        let rowWidth: CGFloat = self.unitsState ? 58 : 32
+    private func drawValue(_ value: Int64, offset: CGPoint, color: NSColor, valueWidth: SpeedValueWidth) -> CGFloat {
+        var rowWidth: CGFloat = self.unitsState ? 58 : 32
         let height: CGFloat = self.frame.height
         let style = NSMutableParagraphStyle()
         style.alignment = self.valueAlignment
         let size: CGFloat = 10
         
         let inputStringAttributes = [
-            NSAttributedString.Key.font: NSFont.systemFont(ofSize: 11, weight: .regular),
+            NSAttributedString.Key.font: self.valueFont(ofSize: 11, weight: .regular),
             NSAttributedString.Key.foregroundColor: color,
             NSAttributedString.Key.paragraphStyle: style
         ]
         
-        let rect = CGRect(x: offset.x, y: (height-size)/2 + offset.y + 1, width: rowWidth - (Constants.Widget.margin.x*2), height: size)
         let value = NSAttributedString.init(
             string: Units(bytes: value).getReadableSpeed(base: base, unit: self.speedUnit, omitUnits: !self.unitsState),
             attributes: inputStringAttributes
         )
+        if !self.fixedSizeState {
+            rowWidth = valueWidth.fit(value.size().width)
+        }
+        
+        let rect = CGRect(x: offset.x, y: (height-size)/2 + offset.y + 1, width: rowWidth - (Constants.Widget.margin.x*2), height: size)
         value.draw(with: rect)
         
         return rowWidth
+    }
+    
+    // digits of the same width keep the fitted width stable while the value changes
+    private func valueFont(ofSize size: CGFloat, weight: NSFont.Weight) -> NSFont {
+        self.fixedSizeState ? NSFont.systemFont(ofSize: size, weight: weight) : NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
     }
     
     private func drawDot(_ offset: CGPoint, color: NSColor) -> CGFloat {
@@ -345,37 +408,42 @@ public class SpeedWidget: WidgetWrapper {
         }
         
         if self.valueState {
-            let rowWidth: CGFloat = self.unitsState ? 48 : 30
+            var rowWidth: CGFloat = self.unitsState ? 48 : 30
             let rowHeight: CGFloat = self.frame.height / 2
             let style = NSMutableParagraphStyle()
             style.alignment = self.valueAlignment
+            let font = self.valueFont(ofSize: 9, weight: .light)
             
             let inputStringAttributes = [
-                NSAttributedString.Key.font: NSFont.systemFont(ofSize: 9, weight: .light),
+                NSAttributedString.Key.font: font,
                 NSAttributedString.Key.foregroundColor: self.inputColor(self.valueColorState),
                 NSAttributedString.Key.paragraphStyle: style
             ]
             let outputStringAttributes = [
-                NSAttributedString.Key.font: NSFont.systemFont(ofSize: 9, weight: .light),
+                NSAttributedString.Key.font: font,
                 NSAttributedString.Key.foregroundColor: self.outputColor(self.valueColorState),
                 NSAttributedString.Key.paragraphStyle: style
             ]
+            
+            let input = NSAttributedString.init(
+                string: Units(bytes: self.inputValue).getReadableSpeed(base: base, unit: self.speedUnit, omitUnits: !self.unitsState),
+                attributes: inputStringAttributes
+            )
+            let output = NSAttributedString.init(
+                string: Units(bytes: self.outputValue).getReadableSpeed(base: base, unit: self.speedUnit, omitUnits: !self.unitsState),
+                attributes: outputStringAttributes
+            )
+            if !self.fixedSizeState {
+                rowWidth = max(self.inputWidth.fit(input.size().width), self.outputWidth.fit(output.size().width))
+            }
             
             let inputY: CGFloat = self.displayValueState == "io" ? rowHeight + 1 : 1
             let outputY: CGFloat = self.displayValueState == "io" ? 1 : rowHeight + 1
             
             var rect = CGRect(x: Constants.Widget.margin.x + x, y: inputY, width: rowWidth - (Constants.Widget.margin.x*2), height: rowHeight)
-            let input = NSAttributedString.init(
-                string: Units(bytes: self.inputValue).getReadableSpeed(base: base, unit: self.speedUnit, omitUnits: !self.unitsState),
-                attributes: inputStringAttributes
-            )
             input.draw(with: rect)
             
             rect = CGRect(x: Constants.Widget.margin.x + x, y: outputY, width: rowWidth - (Constants.Widget.margin.x*2), height: rowHeight)
-            let output = NSAttributedString.init(
-                string: Units(bytes: self.outputValue).getReadableSpeed(base: base, unit: self.speedUnit, omitUnits: !self.unitsState),
-                attributes: outputStringAttributes
-            )
             output.draw(with: rect)
             
             width += rowWidth
@@ -562,6 +630,10 @@ public class SpeedWidget: WidgetWrapper {
             PreferencesRow(localizedString("Units"), component: switchView(
                 action: #selector(self.toggleUnits),
                 state: self.unitsState
+            )),
+            PreferencesRow(localizedString("Static width"), component: switchView(
+                action: #selector(self.toggleSize),
+                state: self.fixedSizeState
             ))
         ]))
         
@@ -599,6 +671,7 @@ public class SpeedWidget: WidgetWrapper {
         self.displayModeView?.isEnabled = key.count > 1
         
         Store.shared.set(key: "\(self.title)_\(self.type.rawValue)_displayValue", value: key)
+        self.resetValueWidth()
         self.display()
     }
     
@@ -606,6 +679,7 @@ public class SpeedWidget: WidgetWrapper {
         guard let key = sender.representedObject as? String else { return }
         self.modeState = key
         Store.shared.set(key: "\(self.title)_\(self.type.rawValue)_mode", value: key)
+        self.resetValueWidth()
         self.display()
     }
     
@@ -615,13 +689,28 @@ public class SpeedWidget: WidgetWrapper {
         self.valueColorView?.isEnabled = self.valueState
         self.valueAlignmentView?.isEnabled = self.valueState
         Store.shared.set(key: "\(self.title)_\(self.type.rawValue)_value", value: self.valueState)
+        self.resetValueWidth()
         self.display()
     }
     
     @objc private func toggleUnits(_ sender: NSControl) {
         self.unitsState = controlState(sender)
         Store.shared.set(key: "\(self.title)_\(self.type.rawValue)_units", value: self.unitsState)
+        self.resetValueWidth()
         self.display()
+    }
+    
+    @objc private func toggleSize(_ sender: NSControl) {
+        self.fixedSizeState = controlState(sender)
+        Store.shared.set(key: "\(self.title)_\(self.type.rawValue)_size", value: self.fixedSizeState)
+        self.resetValueWidth()
+        self.display()
+    }
+    
+    // forget the fitted width when the layout of the value changes
+    private func resetValueWidth() {
+        self.inputWidth.reset()
+        self.outputWidth.reset()
     }
     
     @objc private func toggleIcon(_ sender: NSMenuItem) {
@@ -665,7 +754,7 @@ public class SpeedWidget: WidgetWrapper {
         let input = abs(input)
         let output = abs(output)
         let updated = self.queue.sync { () -> Bool in
-            var updated = false
+            var updated = self._widthSettling // redraw to let the width shrink, even if the values are the same
             if self._inputValue != input {
                 self._inputValue = input
                 updated = true
